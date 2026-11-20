@@ -28,7 +28,7 @@ class Limit
 class TrayForm : Form
 {
     const string UsageUrl = "https://api.anthropic.com/api/oauth/usage";
-    const int PollMinutes = 1;
+    const int PollMinutes = 3;
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string AppName = "ClaudeTray";
 
