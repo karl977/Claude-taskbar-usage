@@ -387,6 +387,9 @@ class TrayForm : Form
 
     // ---------------------------------------------------------------- drawing
 
+    // Remaining quota, 0-100, from the API's "utilization" (percent used).
+    static double Remaining(double used) { return Math.Min(100, Math.Max(0, 100 - used)); }
+
     static Color LevelColor(double pct)
     {
         if (pct >= 90) return Color.FromArgb(255, 239, 83, 80);
@@ -425,7 +428,7 @@ class TrayForm : Form
             var bottoms = new List<string>();
             foreach (var l in limits)
             {
-                string pctText = l.Pct.HasValue ? Math.Round(l.Pct.Value) + "%" : "--";
+                string pctText = l.Pct.HasValue ? Math.Round(Remaining(l.Pct.Value)) + "%" : "--";
                 string resetText = l.Reset.HasValue ? FormatSpan(l.Reset.Value - now) : "";
                 float wTop = mg.MeasureString(l.Label + " ", fLabel, 1000, fmt).Width + mg.MeasureString(pctText, fPct, 1000, fmt).Width;
                 float wBot = mg.MeasureString(resetText, fSmall, 1000, fmt).Width;
@@ -468,7 +471,7 @@ class TrayForm : Form
                         FillRound(g, bTrack, bx, barY, bw, barH);
                         if (l.Pct.HasValue && l.Pct.Value > 0)
                         {
-                            float fw = (float)(bw * Math.Min(100, l.Pct.Value) / 100.0);
+                            float fw = (float)(bw * Remaining(l.Pct.Value) / 100.0);
                             using (var bLvl = new SolidBrush(LevelColor(l.Pct.Value)))
                                 FillRound(g, bLvl, bx, barY, Math.Max(fw, barH), barH);
                         }
@@ -513,7 +516,7 @@ class TrayForm : Form
         foreach (var l in limits)
         {
             sb.Append("\n").Append(l.Name).Append(": ");
-            sb.Append(l.Pct.HasValue ? Math.Round(l.Pct.Value, 1) + "% used" : "n/a");
+            sb.Append(l.Pct.HasValue ? Math.Round(Remaining(l.Pct.Value), 1) + "% left (" + Math.Round(l.Pct.Value, 1) + "% used)" : "n/a");
             if (l.Reset.HasValue)
                 sb.Append("\n    resets ").Append(l.Reset.Value.ToString("ddd HH:mm")).Append(" (in ").Append(FormatSpan(l.Reset.Value - now)).Append(")");
         }
