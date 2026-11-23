@@ -34,6 +34,12 @@ class TrayForm : Form
 
     readonly System.Windows.Forms.Timer layoutTimer = new System.Windows.Forms.Timer();
     readonly System.Windows.Forms.Timer pollTimer = new System.Windows.Forms.Timer();
+    readonly System.Windows.Forms.Timer raiseTimer = new System.Windows.Forms.Timer();
+    readonly System.Windows.Forms.Timer menuTimer = new System.Windows.Forms.Timer();
+    Native.WinEventProc winEventProc; // kept in a field so the GC does not collect the callback
+    readonly List<IntPtr> winEventHooks = new List<IntPtr>();
+    DateTime raiseUntil = DateTime.MinValue;
+    bool menuMouseWasDown;
     readonly ToolTip tip = new ToolTip();
     readonly ContextMenuStrip menu = new ContextMenuStrip();
     ToolStripMenuItem startupItem;
@@ -67,7 +73,21 @@ class TrayForm : Form
         menu.Items.Add(startupItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, delegate { Close(); });
-        ContextMenuStrip = menu;
+        // Shown manually: the overlay never activates, so WinForms would not close the menu
+        // on an outside click by itself. menuTimer watches for such clicks instead.
+        menu.Opened += delegate { menuMouseWasDown = true; menuTimer.Start(); };
+        menu.Closed += delegate { menuTimer.Stop(); };
+        menuTimer.Interval = 30;
+        menuTimer.Tick += delegate { CheckMenuOutsideClick(); };
+
+        // After a foreground or minimize change the taskbar may re-raise itself above us for a
+        // moment (e.g. clicking a taskbar button). Re-assert topmost repeatedly for a short while.
+        raiseTimer.Interval = 40;
+        raiseTimer.Tick += delegate
+        {
+            RaiseAboveTaskbar();
+            if (DateTime.Now >= raiseUntil) raiseTimer.Stop();
+        };
 
         tip.InitialDelay = 300;
         tip.AutoPopDelay = 30000;
@@ -78,7 +98,64 @@ class TrayForm : Form
         pollTimer.Interval = PollMinutes * 60 * 1000;
         pollTimer.Tick += delegate { Fetch(); };
 
-        MouseDown += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Fetch(); };
+        MouseDown += delegate(object s, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            if (menu.Visible) menu.Close();
+            Fetch();
+        };
+        MouseUp += delegate(object s, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Right) return;
+            if (menu.Visible) menu.Close();
+            else menu.Show(Cursor.Position);
+        };
+    }
+
+    void CheckMenuOutsideClick()
+    {
+        if (!menu.Visible) { menuTimer.Stop(); return; }
+        bool down = Native.AnyMouseButtonDown();
+        // Ignore the press that opened the menu; react to the next fresh press outside it.
+        if (down && !menuMouseWasDown && !menu.Bounds.Contains(Cursor.Position)
+            && !(Visible && lastBounds.Contains(Cursor.Position)))
+            menu.Close();
+        menuMouseWasDown = down;
+    }
+
+    void RaiseAboveTaskbar()
+    {
+        if (!Visible || !IsHandleCreated) return;
+        Native.SetWindowPos(Handle, Native.HWND_TOPMOST, 0, 0, 0, 0,
+            Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+    }
+
+    void OnWinEvent(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        if (idObject != 0 /*OBJID_WINDOW*/) return;
+        if (evt == Native.EVENT_SYSTEM_FOREGROUND && menu.Visible && hwnd != menu.Handle && hwnd != Handle)
+            menu.Close();
+        RaiseAboveTaskbar();
+        raiseUntil = DateTime.Now.AddMilliseconds(800);
+        if (!raiseTimer.Enabled) raiseTimer.Start();
+    }
+
+    void HookWinEvents()
+    {
+        winEventProc = OnWinEvent;
+        foreach (uint evt in new[] { Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_MINIMIZESTART, Native.EVENT_SYSTEM_MINIMIZEEND })
+        {
+            IntPtr h = Native.SetWinEventHook(evt, evt, IntPtr.Zero, winEventProc, 0, 0,
+                Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
+            if (h != IntPtr.Zero) winEventHooks.Add(h);
+        }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        foreach (var h in winEventHooks) Native.UnhookWinEvent(h);
+        winEventHooks.Clear();
+        base.OnFormClosed(e);
     }
 
     protected override CreateParams CreateParams
@@ -100,6 +177,7 @@ class TrayForm : Form
         Relayout(true);
         layoutTimer.Start();
         pollTimer.Start();
+        HookWinEvents();
         Fetch();
     }
 
@@ -380,8 +458,7 @@ class TrayForm : Form
         else
         {
             // Stay above the taskbar, which re-raises itself when clicked.
-            Native.SetWindowPos(Handle, Native.HWND_TOPMOST, 0, 0, 0, 0,
-                Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+            RaiseAboveTaskbar();
         }
     }
 
@@ -554,6 +631,21 @@ static class Native
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string name);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+
+    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003, EVENT_SYSTEM_MINIMIZESTART = 0x0016, EVENT_SYSTEM_MINIMIZEEND = 0x0017;
+    public const uint WINEVENT_OUTOFCONTEXT = 0x0000, WINEVENT_SKIPOWNPROCESS = 0x0002;
+    public delegate void WinEventProc(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc proc,
+        uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
+
+    public static bool AnyMouseButtonDown()
+    {
+        // VK_LBUTTON, VK_RBUTTON, VK_MBUTTON
+        return (GetAsyncKeyState(0x01) & 0x8000) != 0 || (GetAsyncKeyState(0x02) & 0x8000) != 0
+            || (GetAsyncKeyState(0x04) & 0x8000) != 0;
+    }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
